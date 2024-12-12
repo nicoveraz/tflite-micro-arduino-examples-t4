@@ -1,4 +1,4 @@
-/* Copyright 2022 The TensorFlow Authors. All Rights Reserved.
+/* Copyright 2018 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,84 +13,152 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#if defined(ARDUINO) && !defined(ARDUINO_ARDUINO_NANO33BLE)
-#define ARDUINO_EXCLUDE_CODE
-#endif  // defined(ARDUINO) && !defined(ARDUINO_ARDUINO_NANO33BLE)
-
-#ifndef ARDUINO_EXCLUDE_CODE
-
-#include <algorithm>
-#include <cmath>
-
-#include "PDM.h"
 #include "audio_provider.h"
 #include "micro_features_micro_model_settings.h"
-#include "tensorflow/lite/micro/micro_log.h"
-#include "test_over_serial/test_over_serial.h"
 
-using namespace test_over_serial;
+// For Teensy audio
+#include <Audio.h>
+#include <Wire.h>
+#include <SPI.h>
+
+// Needed for changing sample rate on T4.0
+#if defined(__IMXRT1052__) || defined(__IMXRT1062__)
+#include <utility/imxrt_hw.h>
+#endif
+
+// Teensy Audio Library objects
+AudioInputI2S            i2s1;
+AudioRecordQueue         queue1;
+AudioConnection          patchCord1(i2s1, 0, queue1, 0);
+AudioControlSGTL5000     sgtl5000_1;
+
+// which input on the audio shield will be used?
+// const int myInput = AUDIO_INPUT_LINEIN;
+const int myInput = AUDIO_INPUT_MIC;
+
+// For changing audio sample rate
+void setI2SFreq(int freq) {
+#if defined(KINETISK) // Teensy 3.2/3.5/3.6
+  typedef struct {
+    uint8_t mult;
+    uint16_t div;
+  } __attribute__((__packed__)) tmclk;
+  const int numfreqs = 14;
+  const int samplefreqs[numfreqs] = { 8000, 11025, 16000, 22050, 32000, 44100, 44117.64706 , 48000, 88200, 44117.64706 * 2, 96000, 176400, 44117.64706 * 4, 192000};
+
+#if (F_PLL==16000000)
+  const tmclk clkArr[numfreqs] = {{16, 125}, {148, 839}, {32, 125}, {145, 411}, {64, 125}, {151, 214}, {12, 17}, {96, 125}, {151, 107}, {24, 17}, {192, 125}, {127, 45}, {48, 17}, {255, 83} };
+#elif (F_PLL==72000000)
+  const tmclk clkArr[numfreqs] = {{32, 1125}, {49, 1250}, {64, 1125}, {49, 625}, {128, 1125}, {98, 625}, {8, 51}, {64, 375}, {196, 625}, {16, 51}, {128, 375}, {249, 397}, {32, 51}, {185, 271} };
+#elif (F_PLL==96000000)
+  const tmclk clkArr[numfreqs] = {{8, 375}, {73, 2483}, {16, 375}, {147, 2500}, {32, 375}, {147, 1250}, {2, 17}, {16, 125}, {147, 625}, {4, 17}, {32, 125}, {151, 321}, {8, 17}, {64, 125} };
+#elif (F_PLL==120000000)
+  const tmclk clkArr[numfreqs] = {{32, 1875}, {89, 3784}, {64, 1875}, {147, 3125}, {128, 1875}, {205, 2179}, {8, 85}, {64, 625}, {89, 473}, {16, 85}, {128, 625}, {178, 473}, {32, 85}, {145, 354} };
+#elif (F_PLL==144000000)
+  const tmclk clkArr[numfreqs] = {{16, 1125}, {49, 2500}, {32, 1125}, {49, 1250}, {64, 1125}, {49, 625}, {4, 51}, {32, 375}, {98, 625}, {8, 51}, {64, 375}, {196, 625}, {16, 51}, {128, 375} };
+#elif (F_PLL==180000000)
+  const tmclk clkArr[numfreqs] = {{46, 4043}, {49, 3125}, {73, 3208}, {98, 3125}, {183, 4021}, {196, 3125}, {16, 255}, {128, 1875}, {107, 853}, {32, 255}, {219, 1604}, {214, 853}, {64, 255}, {219, 802} };
+#elif (F_PLL==192000000)
+  const tmclk clkArr[numfreqs] = {{4, 375}, {37, 2517}, {8, 375}, {73, 2483}, {16, 375}, {147, 2500}, {1, 17}, {8, 125}, {147, 1250}, {2, 17}, {16, 125}, {147, 625}, {4, 17}, {32, 125} };
+#elif (F_PLL==216000000)
+  const tmclk clkArr[numfreqs] = {{32, 3375}, {49, 3750}, {64, 3375}, {49, 1875}, {128, 3375}, {98, 1875}, {8, 153}, {64, 1125}, {196, 1875}, {16, 153}, {128, 1125}, {226, 1081}, {32, 153}, {147, 646} };
+#elif (F_PLL==240000000)
+  const tmclk clkArr[numfreqs] = {{16, 1875}, {29, 2466}, {32, 1875}, {89, 3784}, {64, 1875}, {147, 3125}, {4, 85}, {32, 625}, {205, 2179}, {8, 85}, {64, 625}, {89, 473}, {16, 85}, {128, 625} };
+#endif
+
+  for (int f = 0; f < numfreqs; f++) {
+    if ( freq == samplefreqs[f] ) {
+      while (I2S0_MCR & I2S_MCR_DUF) ;
+      I2S0_MDR = I2S_MDR_FRACT((clkArr[f].mult - 1)) | I2S_MDR_DIVIDE((clkArr[f].div - 1));
+      return;
+    }
+  }
+#elif defined(__IMXRT1062__) // Teensy 4.0
+  // PLL between 27*24 = 648MHz und 54*24=1296MHz
+  int n1 = 4; //SAI prescaler 4 => (n1*n2) = multiple of 4
+  int n2 = 1 + (24000000 * 27) / (freq * 256 * n1);
+  double C = ((double)freq * 256 * n1 * n2) / 24000000;
+  int c0 = C;
+  int c2 = 10000;
+  int c1 = C * c2 - (c0 * c2);
+  set_audioClock(c0, c1, c2, true);
+  CCM_CS1CDR = (CCM_CS1CDR & ~(CCM_CS1CDR_SAI1_CLK_PRED_MASK | CCM_CS1CDR_SAI1_CLK_PODF_MASK))
+      | CCM_CS1CDR_SAI1_CLK_PRED(n1-1) // &0x07
+      | CCM_CS1CDR_SAI1_CLK_PODF(n2-1); // &0x3f
+//Serial.printf("SetI2SFreq(%d)\n",freq);
+#endif
+}
 
 namespace {
 bool g_is_audio_initialized = false;
 // An internal buffer able to fit 16x our sample size
-constexpr int kAudioCaptureBufferSize = DEFAULT_PDM_BUFFER_SIZE * 16;
+// AUDIO_BLOCK_SAMPLES is 128 by default in the Teensy Audio Library
+constexpr int kAudioCaptureBufferSize = AUDIO_BLOCK_SAMPLES * 16;
 int16_t g_audio_capture_buffer[kAudioCaptureBufferSize];
 // A buffer that holds our output
 int16_t g_audio_output_buffer[kMaxAudioSampleSize];
 // Mark as volatile so we can check in a while loop to see if
 // any samples have arrived yet.
 volatile int32_t g_latest_audio_timestamp = 0;
-// test_over_serial sample index
-uint32_t g_test_sample_index;
-// test_over_serial silence insertion flag
-bool g_test_insert_silence = true;
 }  // namespace
 
 void CaptureSamples() {
   // This is how many bytes of new data we have each time this is called
-  const int number_of_samples = DEFAULT_PDM_BUFFER_SIZE / 2;
+  const int number_of_samples = AUDIO_BLOCK_SAMPLES;
   // Calculate what timestamp the last audio sample represents
   const int32_t time_in_ms =
-      g_latest_audio_timestamp +
-      (number_of_samples / (kAudioSampleFrequency / 1000));
+    g_latest_audio_timestamp +
+    (number_of_samples / (kAudioSampleFrequency / 1000));
   // Determine the index, in the history of all samples, of the last sample
   const int32_t start_sample_offset =
-      g_latest_audio_timestamp * (kAudioSampleFrequency / 1000);
+    g_latest_audio_timestamp * (kAudioSampleFrequency / 1000);
   // Determine the index of this sample in our ring buffer
   const int capture_index = start_sample_offset % kAudioCaptureBufferSize;
   // Read the data to the correct place in our buffer
-  int num_read =
-      PDM.read(g_audio_capture_buffer + capture_index, DEFAULT_PDM_BUFFER_SIZE);
-  if (num_read != DEFAULT_PDM_BUFFER_SIZE) {
-    MicroPrintf("### short read (%d/%d) @%dms", num_read,
-                DEFAULT_PDM_BUFFER_SIZE, time_in_ms);
-    while (true) {
-      // NORETURN
-    }
+  if (queue1.available()) {
+    memcpy(g_audio_capture_buffer + capture_index, queue1.readBuffer(), AUDIO_BLOCK_SAMPLES * sizeof(int16_t));
+    queue1.freeBuffer();
   }
   // This is how we let the outside world know that new audio data has arrived.
   g_latest_audio_timestamp = time_in_ms;
 }
 
-TfLiteStatus InitAudioRecording() {
-  if (!g_is_audio_initialized) {
-    // Hook up the callback that will be called with each sample
-    PDM.onReceive(CaptureSamples);
-    // Start listening for audio: MONO @ 16KHz
-    PDM.begin(1, kAudioSampleFrequency);
-    // gain: -20db (min) + 6.5db (13) + 3.2db (builtin) = -10.3db
-    PDM.setGain(13);
-    // Block until we have our first audio sample
-    while (!g_latest_audio_timestamp) {
-    }
-    g_is_audio_initialized = true;
+TfLiteStatus InitAudioRecording(tflite::ErrorReporter* error_reporter) {
+  // Teensy Audio initialization stuff
+  // Audio connections require memory, and the record queue
+  // uses this memory to buffer incoming audio.
+  AudioMemory(60);
+
+  // Enable the audio shield, select input, adjust mic gain
+  sgtl5000_1.enable();
+  sgtl5000_1.inputSelect(myInput);
+  sgtl5000_1.micGain(43);
+
+  // This is important, the model was trained at a 16KHz sample rate
+  setI2SFreq(16000);
+
+  // Start up the recording queue
+  queue1.begin();
+
+  // Block until we have our first audio sample
+  while (!g_latest_audio_timestamp) {
+    LatestAudioTimestamp(); // This function polls the queue for incoming blocks
   }
 
   return kTfLiteOk;
 }
 
-TfLiteStatus GetAudioSamples(int start_ms, int duration_ms,
+TfLiteStatus GetAudioSamples(tflite::ErrorReporter* error_reporter,
+                             int start_ms, int duration_ms,
                              int* audio_samples_size, int16_t** audio_samples) {
+  // Set everything up to start receiving audio
+  if (!g_is_audio_initialized) {
+    TfLiteStatus init_status = InitAudioRecording(error_reporter);
+    if (init_status != kTfLiteOk) {
+      return init_status;
+    }
+    g_is_audio_initialized = true;
+  }
   // This next part should only be called when the main thread notices that the
   // latest audio sample data timestamp has changed, so that there's new data
   // in the capture ring buffer. The ring buffer will eventually wrap around and
@@ -113,79 +181,25 @@ TfLiteStatus GetAudioSamples(int start_ms, int duration_ms,
   }
 
   // Set pointers to provide access to the audio
-  *audio_samples_size = duration_sample_count;
+  *audio_samples_size = kMaxAudioSampleSize;
   *audio_samples = g_audio_output_buffer;
 
   return kTfLiteOk;
 }
 
-namespace {
-
-void InsertSilence(const size_t len, int16_t value) {
-  for (size_t i = 0; i < len; i++) {
-    const size_t index = (g_test_sample_index + i) % kAudioCaptureBufferSize;
-    g_audio_capture_buffer[index] = value;
-  }
-  g_test_sample_index += len;
-}
-
-int32_t ProcessTestInput(TestOverSerial& test) {
-  constexpr size_t samples_16ms = ((kAudioSampleFrequency / 1000) * 16);
-
-  InputHandler handler = [](const InputBuffer* const input) {
-    if (0 == input->offset) {
-      // don't insert silence
-      g_test_insert_silence = false;
+// main.cpp calls this, checking if the timestamp has advanced; if so it assumes
+// there are new sample blocks available, and tries to invoke the interpreter
+int32_t LatestAudioTimestamp() {
+  // Are there new blocks available, and if so how many?
+  int num_blocks = queue1.available();
+  if (num_blocks > 0) {
+    // For all new blocks, call CaptureSamples()
+    for (int i = 0; i < num_blocks; i++) {
+      CaptureSamples();
     }
-
-    for (size_t i = 0; i < input->length; i++) {
-      const size_t index = (g_test_sample_index + i) % kAudioCaptureBufferSize;
-      g_audio_capture_buffer[index] = input->data.int16[i];
-    }
-    g_test_sample_index += input->length;
-
-    if (input->total == (input->offset + input->length)) {
-      // allow silence insertion again
-      g_test_insert_silence = true;
-    }
-    return true;
-  };
-
-  test.ProcessInput(&handler);
-
-  if (g_test_insert_silence) {
-    // add 16ms of silence just like the PDM interface
-    InsertSilence(samples_16ms, 0);
   }
 
-  // Round the timestamp to a multiple of 64ms,
-  // This emulates the PDM interface during inference processing.
-  g_latest_audio_timestamp = (g_test_sample_index / (samples_16ms * 4)) * 64;
+  // Any successful calls to CaptureSamples() in the above loop will have
+  // advanced the timestamp, return it here
   return g_latest_audio_timestamp;
 }
-
-}  // namespace
-
-int32_t LatestAudioTimestamp() {
-  TestOverSerial& test = TestOverSerial::Instance(kAUDIO_PCM_16KHZ_MONO_S16);
-  if (!test.IsTestMode()) {
-    // check serial port for test mode command
-    test.ProcessInput(nullptr);
-  }
-  if (test.IsTestMode()) {
-    if (g_is_audio_initialized) {
-      // stop capture from hardware
-      PDM.end();
-      g_is_audio_initialized = false;
-      g_test_sample_index =
-          g_latest_audio_timestamp * (kAudioSampleFrequency / 1000);
-    }
-    return ProcessTestInput(test);
-  } else {
-    // CaptureSamples() updated the timestamp
-    return g_latest_audio_timestamp;
-  }
-  // NOTREACHED
-}
-
-#endif  // ARDUINO_EXCLUDE_CODE
