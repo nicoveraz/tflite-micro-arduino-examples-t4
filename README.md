@@ -1,5 +1,7 @@
 # TensorFlow Lite Micro Library for Arduino
 
+## Support for Teensy 4.0 board on speech example
+
 This repository has the code (including examples) needed to use Tensorflow Lite Micro on an Arduino.
 
 ## Table of contents
